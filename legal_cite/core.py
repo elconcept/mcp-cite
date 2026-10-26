@@ -8,6 +8,7 @@ nie pierwotne z dnia ogłoszenia.
 from __future__ import annotations
 
 import bisect
+import contextvars
 import datetime as _dt
 import html as _html
 import re
@@ -15,6 +16,14 @@ import time
 
 import logging
 import httpx
+
+# Dzień, na który wybierane jest brzmienie (verify_article z na_dzien); domyślnie dziś.
+_NA_DZIEN: contextvars.ContextVar[_dt.date | None] = contextvars.ContextVar("na_dzien", default=None)
+
+
+def _dzis() -> _dt.date:
+    return _NA_DZIEN.get() or _dt.date.today()
+
 
 # --- Akty PL → ELI: api.sejm.gov.pl/eli/acts/{pub}/{year}/{pos}/text.html ---
 # pos = pozycja w Dzienniku Ustaw (poz. N)
@@ -43,9 +52,15 @@ PL_ACTS: dict[str, dict] = {
     "u.k.w.h.": dict(pub="DU", year=1982, pos=147,  name="Ustawa o księgach wieczystych i hipotece"),
     "u.c.":     dict(pub="DU", year=2013, pos=1650, name="Ustawa o cudzoziemcach"),
     "ustawy o cudzoziemcach": dict(pub="DU", year=2013, pos=1650, name="Ustawa o cudzoziemcach"),
+    # nabywanie nieruchomości przez cudzoziemców: akt pierwotny Dz.U. 1920 nr 31 poz. 178 (ELI DU/1920/178),
+    # t.j. Dz.U. 2017 poz. 2278 (HTML); nowela Dz.U. 2026 poz. 1099 w życie 19.11.2026 (sprawdzone w ELI 2026-10-24)
+    "UNNC":     dict(pub="DU", year=1920, pos=178,  name="Ustawa o nabywaniu nieruchomości przez cudzoziemców"),
+    "u.n.n.c.": dict(pub="DU", year=1920, pos=178,  name="Ustawa o nabywaniu nieruchomości przez cudzoziemców"),
+    "ustawy o nabywaniu nieruchomości przez cudzoziemców": dict(pub="DU", year=1920, pos=178, name="Ustawa o nabywaniu nieruchomości przez cudzoziemców"),
     "KW":      dict(pub="DU", year=1971, pos=114,  name="Kodeks wykroczeń"),
     "KPK":      dict(pub="DU", year=1997, pos=555,  name="Kodeks postępowania karnego"),
     "KKS":      dict(pub="DU", year=1999, pos=930,  name="Kodeks karny skarbowy"),
+    "KKW":      dict(pub="DU", year=1997, pos=557,  name="Kodeks karny wykonawczy"),
     "KPA":      dict(pub="DU", year=1960, pos=168,  name="Kodeks postępowania administracyjnego"),
     "PPSA":     dict(pub="DU", year=2002, pos=1270, name="Prawo o postępowaniu przed sądami administracyjnymi"),
     # podatkowe i majątkowe
@@ -160,17 +175,22 @@ def parse_citation(raw: str) -> dict | None:
 def _art_regex(raw_art: str) -> str:
     """Buduje fragment regex dopasowujący numer artykułu w tekście źródła,
     tolerancyjnie na spacje. 385¹→'385\\s+1' (źródło: „Art. 385 1 ."),
-    36a→'36\\s*a', 59aa→'59\\s*aa', 45→'45'."""
-    s = re.sub(r'([¹²³⁴⁵⁶⁷⁸⁹⁰]+)', lambda mm: ' ' + mm.group(1).translate(_SUP), raw_art.strip())
-    s = re.sub(r'\s*[\[\(\^]\s*(\d+)\s*[\]\)]?', r' \1', s)  # [1]/(1)/^1 → " 1"
-    s = re.sub(r'\s+', ' ', s).strip()
-    parts = s.split(' ')
-    if len(parts) == 2 and parts[1].isdigit():               # baza + indeks górny
-        return rf'{re.escape(parts[0])}\s+{re.escape(parts[1])}'
-    mlet = re.match(r'^(\d+)([a-zA-Z]+)$', parts[0])
-    if mlet:                                                  # sufiks literowy 36a, 59aa
-        return rf'{mlet.group(1)}\s*{mlet.group(2)}'
-    return re.escape(parts[0])
+    36a→'36\\s*a', 59aa→'59\\s*aa', 45→'45', 131¹ᵃ/131[1a]→'131\\s+1\\s*a'.
+
+    Indeks z literą musi zostać w wzorcu: wcześniej „131[1a]” dawało samo
+    '131', więc ścieżka zapasowa oddawała art. 131 jako art. 131¹ᵃ — w trybie
+    na_dzien przy t.j. sprzed dodania jednostki (#11). Numer, którego nie da
+    się rozpoznać, daje wzorzec niedopasowujący niczego zamiast gołej bazy."""
+    s = _indeks_na_nawias(raw_art.strip())                    # 131¹ᵃ → 131[1a]
+    s = re.sub(r'\s*[\(\^]\s*(\d+[a-z]*)\s*\)?', r'[\1]', s)   # 131(1a) / 131^1 → 131[1a]
+    s = re.sub(r'\s+', '', s).lower()
+    m = re.fullmatch(r'(\d+)([a-z]*)(?:\[(\d+)([a-z]*)\])?', s)
+    if not m:
+        return r'(?!)'
+    baza = m.group(1) + (rf'\s*{m.group(2)}' if m.group(2) else '')
+    if not m.group(3):
+        return baza
+    return baza + rf'\s+{m.group(3)}' + (rf'\s*{m.group(4)}' if m.group(4) else '')
 
 
 def _strip_html(raw_html: str) -> str:
@@ -259,10 +279,65 @@ async def _teksty_jednolite(info: dict) -> list[dict]:
     return out
 
 
-def _nowelizacje_po(zmieniajace: list[dict], data: str) -> int:
-    """Liczba aktów zmieniających, które weszły w życie po dacie data
-    (pole date w API ELI to data wejścia w życie zmiany)."""
-    return sum(1 for e in zmieniajace if data and (e.get("date") or "") > data)
+def _nowelizacje_po(zmieniajace: list[dict], data: str,
+                    dzis: _dt.date | None = None) -> tuple[list, list]:
+    """Akty zmieniające z datą po dacie t.j., rozdzielone na te, które weszły
+    w życie (data <= dziś), i oczekujące (data w przyszłości). Pole date
+    w wykazie ELI to data wejścia w życie zmiany tego aktu — dla Dz.U. 2026
+    poz. 507 przy k.c. 1.11.2028, więc liczenie bez daty dzisiejszej pisało
+    przy każdym artykule k.c. „weszła w życie 1 nowelizacja”.
+    Zwraca dwie listy (id, data ISO) posortowane po dacie."""
+    if not data:
+        return [], []
+    dzis_iso = (dzis or _dt.date.today()).isoformat()
+    po = sorted(((e.get("id") or "?", e.get("date") or "") for e in zmieniajace
+                 if (e.get("date") or "") > data), key=lambda x: (x[1], x[0]))
+    return [x for x in po if x[1] <= dzis_iso], [x for x in po if x[1] > dzis_iso]
+
+
+def _adres_dz_u(ident: str) -> str:
+    """„DU/2026/507” → „Dz.U. 2026 poz. 507”."""
+    cz = ident.split("/")
+    return f"Dz.U. {cz[1]} poz. {cz[2]}" if len(cz) == 3 and cz[0] == "DU" else ident
+
+
+def _data_pl(iso: str) -> str:
+    try:
+        return f"{_dt.date.fromisoformat(iso):%d.%m.%Y}"
+    except ValueError:
+        return iso or "data nieznana"
+
+
+def _lista_nowelizacji(akty: list, maks: int = 8) -> str:
+    opis = ", ".join(f"{_adres_dz_u(i)} ({_data_pl(d)})" for i, d in akty[:maks])
+    return opis + (f" i {len(akty) - maks} innych" if len(akty) > maks else "")
+
+
+def _aktualnosc_pl(zmieniajace: list[dict], data_tj: str) -> tuple[str, str, str]:
+    """Linia „Aktualność”, kod dla modelu i pola z identyfikatorami aktów.
+
+    Lista zamiast licznika: model może zacytować i sprawdzić konkretny akt.
+    Nowelizacje oczekujące są osobno — nie zmieniają dzisiejszego brzmienia,
+    ale zmienią je w podanym dniu (umowy, terminy)."""
+    weszle, oczekujace = _nowelizacje_po(zmieniajace, data_tj)
+    if weszle:
+        n = len(weszle)
+        czas = ("weszła" if n == 1 else
+                "weszły" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "weszło")
+        tekst = (f"nieustalona — po dacie tego t.j. ({data_tj}) {czas} w życie "
+                 f"{_odmiana_nowelizacji(n)}: {_lista_nowelizacji(weszle)}; "
+                 f"sprawdź, czy dotyczy to tego artykułu")
+        kod = f"nieustalona_{len(weszle)}_nowelizacji_po_tj"
+    else:
+        tekst = (f"wg wykazu aktów zmieniających w API ELI po dacie tego t.j. "
+                 f"({data_tj}) nie weszła w życie żadna nowelizacja")
+        kod = "potwierdzona_wg_wykazu_eli"
+    if oczekujace:
+        tekst += (f". Oczekuje (jeszcze nie obowiązuje, data wg wykazu ELI): "
+                  f"{_lista_nowelizacji(oczekujace)}")
+    pola = ("; nowelizacje_po_tj=" + (",".join(f"{i}@{d}" for i, d in weszle) or "brak")
+            + "; nowelizacje_oczekujace=" + (",".join(f"{i}@{d}" for i, d in oczekujace) or "brak"))
+    return tekst, kod, pola
 
 
 async def _fetch_pl(info: dict) -> str | None:
@@ -280,7 +355,7 @@ async def _fetch_pl(info: dict) -> str | None:
         _cache[key] = text
         _html_cache[key] = wpis["html_text"]
         data = wpis["meta"].get("announcementDate") or ""
-        _zrodlo[key] = (wpis["id"], data, _nowelizacje_po(wpis["zmieniajace"], data))
+        _zrodlo[key] = (wpis["id"], data, wpis["zmieniajace"])
         return text
     return None
 
@@ -444,7 +519,9 @@ def _cut_ustep(art_text: str, ustep: str) -> str | None:
               rf'|{re.escape(sup)})\s?\.\s')
     else:
         nr = rf'{re.escape(baza)}\.\s'
-    m = re.search(rf'(?:§\s*)?(?<![\d\w])(?<!\d\s){nr}', art_text)
+    # „(?<!Art\.\s)”: nagłówek „Art. 1.” nie jest ustępem 1 — bez tego „art. 1 ust. 1” aktu
+    # o numeracji „Art. 1. 1. Nabycie…” (u.n.n.c.) oddawał samo „1.” (granica = następny ustęp)
+    m = re.search(rf'(?:§\s*)?(?<![\d\w])(?<!\d\s)(?<!Art\.\s){nr}', art_text)
     if not m:
         return None
     ust_start = m.start()
@@ -677,7 +754,7 @@ def _jeszcze_nie(mapa: dict[str, str], nr: str | None,
 def _kanon_art(raw_art: str) -> str | None:
     """Numer artykułu w zapisie, jakim posługuje się źródło w data-id:
     385¹/385[1]/385(1) → '385_1', 36a → '36a', 59aa → '59aa', 45 → '45'."""
-    s = re.sub(r'\s+', '', raw_art.strip())
+    s = re.sub(r'\s+', '', _indeks_na_nawias(raw_art.strip()))  # 131¹ᵃ → 131[1a]
     s = re.sub(r'([¹²³⁴⁵⁶⁷⁸⁹⁰]+)', lambda m: '_' + m.group(1).translate(_SUP), s)
     s = re.sub(r'[\[\(\^]\s*(\d+[a-z]*)\s*[\]\)]?', r'_\1', s).lower()
     return s if re.fullmatch(r'\d+[a-ząćęłńóśźż]*(?:_\d+[a-ząćęłńóśźż]*)*', s) else None
@@ -800,6 +877,11 @@ def _wybierz_podjednostki_html(html: str, mapa: dict[str, str], dzis: _dt.date,
     return html
 
 
+# Pogrubiony nagłówek artykułu w treści akapitu: t.j. u.ś.u.d.e. (Dz.U. 2024 poz. 1513)
+# drukuje „<B>Art. 15. </B>” w akapicie art. 14 ust. 4 i nie daje art. 15 własnej jednostki.
+_WKLEJONY_ART_RE = re.compile(r'<B\b[^>]*>\s*Art\.(?:\s|&nbsp;)*(\d+[a-z]*)\s*\.\s*</B>', re.IGNORECASE)
+
+
 def _jednostki_html(key: str, raw_html: str) -> list[tuple[str, str, _dt.date | None]]:
     """Artykuły właściwego aktu wg znaczników źródła, w kolejności dokumentu.
 
@@ -811,7 +893,7 @@ def _jednostki_html(key: str, raw_html: str) -> list[tuple[str, str, _dt.date | 
     if key in _jedn_cache:
         return _jedn_cache[key]
     mapa = _odnosniki(key, raw_html)
-    dzis = _dt.date.today()
+    dzis = _dzis()
     out = []
     for m in _UNIT_RE.finditer(raw_html):
         if 'pass_' in m.group(1):
@@ -821,14 +903,26 @@ def _jednostki_html(key: str, raw_html: str) -> list[tuple[str, str, _dt.date | 
         przyszle = _jeszcze_nie(mapa, _wlasny_odnosnik_html(fragment, 0, len(fragment)), dzis)
         uwagi: list[str] = []
         fragment = _wybierz_podjednostki_html(fragment, mapa, dzis, uwagi)
-        num = m.group(2).lower()
+        # „arti_131_1_a” (t.j. 2024) i „arti_131_1a” to ten sam art. 131¹ᵃ — klucz jak
+        # w _kanon_art; inaczej artykuł z literą w indeksie szedł ścieżką zapasową,
+        # która nie sprawdza dat wejścia w życie (#11)
+        num = re.sub(r'_(\d+)_([a-z]+)$', r'_\1\2', m.group(2).lower())
         ktore = sum(1 for n, *_ in out if n == num)
         if uwagi:
             _uwagi_jedn[(key, num, ktore)] = uwagi
         if przyszle:
             _przyszle_jedn[(key, num, ktore)] = przyszle
-        out.append((num, _strip_html(fragment),
+        # nagłówek innego artykułu wklejony w treść tej jednostki (za jej własnym <h3>),
+        # gdy źródło nie ma dla niego osobnej jednostki — tniemy przed nim (#7)
+        wklejony = _WKLEJONY_ART_RE.search(fragment, max(fragment.find("</h3>") + 5, 5))
+        if wklejony and (wklejony.group(1).lower() == num.split("_")[0]
+                         or f'data-id="arti_{wklejony.group(1).lower()}"' in raw_html):
+            wklejony = None
+        tekst = fragment[:wklejony.start()] if wklejony else fragment
+        out.append((num, _strip_html(tekst),
                     _data_wejscia(mapa, odn.group(1)) if odn else None))
+        if wklejony:
+            out.append((wklejony.group(1).lower(), _strip_html(fragment[wklejony.start():]), None))
     out = _napraw_zlepki(key, out)
     _jedn_cache[key] = out
     return out
@@ -910,7 +1004,7 @@ def extract_pl_article_html(key: str, raw_html: str, art: str,
     if not trafienia:
         return None
 
-    dzis = _dt.date.today()
+    dzis = _dzis()
     wybor, nieznane = 0, False
     if len(trafienia) > 1:
         for i, (_, data) in enumerate(trafienia[1:], start=1):
@@ -1025,13 +1119,22 @@ def _podstawa_tekstu(info: dict) -> str:
     zr = _zrodlo.get(f"PL:{info['pub']}:{info['year']}:{info['pos']}")
     if not zr or len(zr) != 3:
         return ""
-    ident, data, po = zr
+    ident, data, zmieniajace = zr
     if not data:
         return f"\n(tekst jednolity {ident})"
-    opis = f"\n(tekst jednolity {ident} z {data}"
-    if po:
-        opis += f"; **po tej dacie weszło {po} nowelizacji** — sprawdź aktualność"
-    return opis + ")"
+    aktualnosc, _, _ = _aktualnosc_pl(zmieniajace, data)
+    return f"\n(tekst jednolity {ident} z {data})\nAktualność: {aktualnosc}"
+
+
+def _dla_modelu_html(info: dict) -> str:
+    """Linia [dla modelu] dla ścieżki, w której najnowszy t.j. jest w HTML."""
+    zr = _zrodlo.get(_klucz_pl(info))
+    if not zr or len(zr) != 3 or not zr[1]:
+        return ""
+    ident, data, zmieniajace = zr
+    _, kod, pola = _aktualnosc_pl(zmieniajace, data)
+    return (f"\n\n[dla modelu] zrodlo=urzedowy_html; aktualnosc={kod}{pola}; "
+            f"cytuj_jako=„tekst urzędowy, t.j. {ident}”; nie_nazywaj_tekstem_urzedowym=nie_dotyczy")
 
 
 def _odmiana_nowelizacji(n: int) -> str:
@@ -1099,7 +1202,7 @@ async def _odpowiedz_pl(info: dict, art: str, ustep: str | None, ref: str) -> st
             return f"❌ {ref} nie znaleziony w {info['name']}. Sprawdź numer artykułu."
         podstawa = _podstawa_tekstu(info)
         return (f"📜 **{info['name']}**, {ref}\n(źródło: api.sejm.gov.pl, tekst urzędowy HTML)"
-                f"{podstawa}\n\n{result}")
+                f"{podstawa}\n\n{result}{_dla_modelu_html(info)}")
     return await _odpowiedz_pdf(info, tj, art, ustep, ref)
 
 
@@ -1167,7 +1270,7 @@ async def _odpowiedz_pdf(info: dict, tj: list[dict], art: str, ustep: str | None
                            "numery artykułów w odczycie nie rosną w kolejności dokumentu, "
                            "więc granicom artykułów nie można ufać", starszy_id)
 
-    dzis = _dt.date.today()
+    dzis = _dzis()
     wybor, nieznane = _wybierz_brzmienie([j.data for j in trafienia], dzis)
     jedn = trafienia[wybor]
     # artykuł wydrukowany z wyprzedzeniem (dodany nowelizacją, która jeszcze nie
@@ -1246,15 +1349,7 @@ async def _odpowiedz_pdf(info: dict, tj: list[dict], art: str, ustep: str | None
         if not tekst:
             return f"❌ {ref} nie znaleziony w {info['name']} ({adres}). Sprawdź numer ustępu."
 
-    po = _nowelizacje_po(zmieniajace, od.data_tj)
-    if po:
-        aktualnosc = (f"nieustalona — po dacie tego t.j. ({od.data_tj}) weszło w życie "
-                      f"{_odmiana_nowelizacji(po)}; sprawdź, czy dotyczy to tego artykułu")
-        akt_kod = f"nieustalona_{po}_nowelizacji_po_tj"
-    else:
-        aktualnosc = (f"wg wykazu aktów zmieniających w API ELI po dacie tego t.j. "
-                      f"({od.data_tj}) nie weszła w życie żadna nowelizacja")
-        akt_kod = "potwierdzona_wg_wykazu_eli"
+    aktualnosc, akt_kod, pola_nowel = _aktualnosc_pl(zmieniajace, od.data_tj)
 
     uwagi = "".join("\n\n" + u for u in jedn.uwagi)
     if len(trafienia) > 1:
@@ -1276,7 +1371,8 @@ async def _odpowiedz_pdf(info: dict, tj: list[dict], art: str, ustep: str | None
              f"nieurzędowy odczyt {adres} (PDF), nie tekst urzędowy")
     return (f"{znacznik} **{info['name']}**, {ref}\n{naglowek}\n"
             f"Aktualność: {aktualnosc}\n\n{tekst}{uwagi}\n\n"
-            f"[dla modelu] zrodlo={zrodlo}; wiernosc={wiernosc}; aktualnosc={akt_kod}; "
+            f"[dla modelu] zrodlo={zrodlo}; wiernosc={wiernosc}; aktualnosc={akt_kod}"
+            f"{pola_nowel}; "
             f"cytuj_jako=„{cytuj}”; nie_nazywaj_tekstem_urzedowym="
             f"{'nie_dotyczy' if zrodlo == 'urzedowy_html' else 'tak'}")
 
